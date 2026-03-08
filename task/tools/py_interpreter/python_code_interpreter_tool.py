@@ -37,7 +37,17 @@ class PythonCodeInterpreterTool(BaseTool):
         # 3. Set _code_execute_tool: Optional[MCPToolModel] as None at start, then iterate through `mcp_tool_models` and
         #    if any of tool model has the same same as `tool_name` then set _code_execute_tool as tool model
         # 4. If `_code_execute_tool` is null then raise error (We cannot set up PythonCodeInterpreterTool without tool that executes code)
-        raise NotImplementedError()
+        self.dial_endpoint = dial_endpoint
+        self.mcp_client = mcp_client
+        self._code_execute_tool: Optional[MCPToolModel] = None
+        
+        for tool_model in mcp_tool_models:
+            if tool_model.name == tool_name:
+                self._code_execute_tool = tool_model
+                break
+
+        if self._code_execute_tool is None:
+            raise ValueError(f"Tool with name {tool_name} not found in provided mcp_tool_models")
 
     @classmethod
     async def create(
@@ -51,27 +61,36 @@ class PythonCodeInterpreterTool(BaseTool):
         # 1. Create MCPClient
         # 2. Get tools
         # 3. Create PythonCodeInterpreterTool instance and return it
-        raise NotImplementedError()
+        mcp_client = await MCPClient.create(mcp_url)
+        mcp_tool_models = await mcp_client.get_tools()
+
+        return cls(
+            mcp_client=mcp_client,
+            mcp_tool_models=mcp_tool_models,
+            tool_name=tool_name,
+            dial_endpoint=dial_endpoint,
+        )
 
     @property
     def show_in_stage(self) -> bool:
         # TODO: set as False since we will have custom variant of representation in Stage
-        raise NotImplementedError()
+        return False
 
     @property
     def name(self) -> str:
         # TODO: provide `_code_execute_tool` name
-        raise NotImplementedError()
+        return self._code_execute_tool.name # type: ignore
 
     @property
     def description(self) -> str:
         # TODO: provide `_code_execute_tool` description
-        raise NotImplementedError()
-
+        return self._code_execute_tool.description # type: ignore
+        
+    
     @property
     def parameters(self) -> dict[str, Any]:
         # TODO: provide `_code_execute_tool` parameters
-        raise NotImplementedError()
+        return self._code_execute_tool.parameters # type: ignore
 
     async def _execute(self, tool_call_params: ToolCallParams) -> str | Message:
         #TODO:
@@ -107,4 +126,90 @@ class PythonCodeInterpreterTool(BaseTool):
         #     to 1000 chars, it is needed to avoid high costs and context window overload
         # 13. Append to stage response f"```json\n\r{execution_result.model_dump_json(indent=2)}\n\r```\n\r"
         # 14. Return execution result as string (model_dump_json method)
-        raise NotImplementedError()
+        arguments = json.loads(tool_call_params.tool_call.function.arguments)
+        code = arguments.get("code")
+        session_id = arguments.get("session_id", None)
+        stage = tool_call_params.stage
+        stage.append_content("## Request arguments: \n")
+        stage.append_content(f"```python\n\r{code}\n\r```\n\r")
+
+        if session_id:
+            stage.append_content(f"**session_id**: {session_id}\n\r")
+        else:
+            stage.append_content("New session will be created\n\r")
+
+        tool_response = await self.mcp_client.call_tool(
+            tool_name=self.name, # type: ignore
+            tool_args=arguments
+        )
+
+        tool_response_json = json.loads(tool_response)
+        execution_result = _ExecutionResult.model_validate(tool_response_json)
+
+        files_attached = False
+        if execution_result.files and len(execution_result.files) > 0:
+            dial_client = Dial(base_url=self.dial_endpoint, api_key=tool_call_params.api_key)
+            files_home = dial_client.my_appdata_home()
+
+            if files_home is None:
+                raise Exception("Failed to retrieve my_appdata_home from DIAL client")
+
+            for file in execution_result.files:
+                file_name = file.name
+                mime_type = file.mime_type
+                resource_content = await self.mcp_client.get_resource(AnyUrl(file.uri))
+
+                if (
+                    mime_type.startswith("text/") 
+                    or mime_type in ['application/json', 'application/xml']
+                ):
+                    file_content = resource_content.encode(encoding='utf-8') # type: ignore
+                else:
+                    file_content = base64.b64decode(resource_content)
+
+                upload_url = f"files/{(files_home / file_name).as_posix()}"
+                dial_client.files.upload(upload_url, file_content)
+                
+                attachment = Attachment(
+                    url=upload_url,
+                    type=mime_type,
+                    title=file_name
+                )
+                
+                stage.add_attachment(attachment)
+                tool_call_params.choice.add_attachment(attachment)
+
+                files_attached = True
+
+
+        if execution_result.output:
+            new_output = []
+            for output in execution_result.output:
+                if len(output) > 1000:
+                    new_output.append(output[:1000] + "\n\n[Output truncated due to length]")
+                else:
+                    new_output.append(output)
+
+            execution_result.output = new_output
+        
+        stage.append_content(f"```json\n\r{execution_result.model_dump_json(indent=2)}\n\r```\n\r")
+
+        # Generate the base response
+        result_json = execution_result.model_dump_json()
+        
+        # If files were attached, append critical instructions for the LLM
+        if files_attached:
+            file_names = [file.name for file in execution_result.files]
+            file_list = ", ".join(file_names)
+            instruction = (
+                f"\n\n**CRITICAL INSTRUCTIONS**\n"
+                f"The following files have been generated and attached: {file_list}\n"
+                f"- DO NOT include download links or URLs in your response\n"
+                f"- DO NOT embed or display file contents inline\n"
+                f"- Simply reference the files naturally; they are already attached and visible to the user\n"
+                f"- The files exist in the attachments section of this response"
+            )
+            result_json += instruction
+        
+        return result_json
+

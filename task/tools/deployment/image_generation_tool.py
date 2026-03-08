@@ -22,28 +22,74 @@ class ImageGenerationTool(DeploymentTool):
         #    'The image has been successfully generated according to request and shown to user!'
         #    Sometimes models are trying to add generated pictures as well to content (choice), with this instruction
         #    we are notifing LLLM that it was done (but anyway sometimes it will try to add file 😅)
-        raise NotImplementedError()
+        message = await super()._execute(tool_call_params)
+        choice = tool_call_params.choice
+
+        if isinstance(message, Message) and message.custom_content and message.custom_content.attachments:
+            attachments = message.custom_content.attachments
+            image_attachments = [a for a in attachments if a.type in ["image/png", "image/jpeg"]]
+
+            for attachment in image_attachments:
+                choice.append_content(f"\n\r![image]({attachment.url})\n\r")
+
+            if not message.content:
+                message.content = 'The image has been successfully generated according to request and shown to user!'    
+        
+        return message
 
     @property
     def deployment_name(self) -> str:
         # TODO: provide deployment name for model that you have added to DIAL Core config (dall-e-3)
-        raise NotImplementedError()
+        return "dall-e-3"
 
     @property
     def name(self) -> str:
         # TODO: provide self-descriptive name
-        raise NotImplementedError()
+        return "image_generator"
 
     @property
     def description(self) -> str:
         # TODO: provide tool description that will help LLM to understand when to use this tools and cover 'tricky'
         #  moments (not more 1024 chars)
-        raise NotImplementedError()
+        return "Tool for generating images based on text descriptions. " \
+         "Default image size is 1024x1024, style is natural and quality is standard." \
+         "You can customize these parameters by providing `size`, `style`, and `quality` parameters in the request. " \
+         "Supported sizes: '256x256', '512x512', '1024x1024'. " \
+         "Supported styles: 'natural', 'vivid'. " \
+         "Supported quality: 'standard', 'hs'."
+
     @property
     def parameters(self) -> dict[str, Any]:
         # TODO: provide tool parameters JSON Schema:
         #  - prompt is string, description: "Extensive description of the image that should be generated.", required
         #  - there are 3 optional parameters: https://platform.openai.com/docs/guides/image-generation?image-generation-model=dall-e-3#customize-image-output
         #  - Sample: https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/dall-e?tabs=dalle-3#call-the-image-generation-api
-        raise NotImplementedError()
+        return {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Extensive description of the image that should be generated."
+                },
+                "size": {
+                    "type": "string",
+                    "default": "1024x1024",
+                    "description": "The size of the generated images. Must be one of '256x256', '512x512', or '1024x1024'.",
+                    "enum": ["256x256", "512x512", "1024x1024"]
+                },
+                "style": {
+                    "type": "string",
+                    "default": "natural",
+                    "description": "The style of the generated images. Must be one of 'natural' or 'vivid'.",
+                    "enum": ["natural", "vivid"]
+                },
+                "quality": {
+                    "type": "string",
+                    "default": "standard",
+                    "description": "The quality of the generated images. Must be one of 'standard' or 'hd'.",
+                    "enum": ["standard", "hd"]
+                }
+            },
+            "required": ["prompt"]
+        }
 

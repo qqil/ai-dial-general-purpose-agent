@@ -42,4 +42,60 @@ class DeploymentTool(BaseTool, ABC):
         # 6. Collect content and it to stage, also, collect custom_content -> attachments and if they are present add
         #    them to stage as attachment as well
         # 7. Return Message with tool role, content, custom_content and tool_call_id
-        raise NotImplementedError()
+        arguments = json.loads(tool_call_params.tool_call.function.arguments)
+        tool_call_id = tool_call_params.tool_call.id
+        stage = tool_call_params.stage
+        prompt = arguments.get("prompt")
+
+        del arguments["prompt"]
+
+        client = AsyncDial(
+            api_version="2025-01-01-preview", 
+            api_key=tool_call_params.api_key, 
+            base_url=self.endpoint
+        )
+
+        user_message: dict[str, Any] = { "role": Role.USER, "content": prompt }
+        chunks = await client.chat.completions.create(
+            messages=[user_message], # type: ignore
+            stream=True,
+            deployment_name=self.deployment_name,
+            extra_body={"custom_fields": { "configuration": { **arguments }}}, 
+            **self.tool_parameters
+        )
+
+        content = ""
+        custom_content = CustomContent(attachments=[])
+        
+        async for chunk in chunks:
+            if not chunk.choices or not chunk.choices[0].delta:
+                continue
+
+            delta = chunk.choices[0].delta
+
+            if delta.content:
+                content += chunk.choices[0].delta.content
+            
+            if delta.custom_content and delta.custom_content.attachments:
+                if (custom_content.attachments is None):
+                    custom_content.attachments = []
+                custom_content.attachments.extend(delta.custom_content.attachments)
+
+                for attachment in delta.custom_content.attachments:
+                    stage.add_attachment(
+                        title=attachment.title,
+                        url=attachment.url,
+                        type=attachment.type,
+                        data=attachment.data,
+                        reference_type=attachment.reference_type,
+                        reference_url=attachment.reference_url
+                    )
+
+        return Message(
+            role=Role.TOOL,
+            content=content,
+            custom_content=custom_content,
+            tool_call_id=tool_call_id
+        )
+
+

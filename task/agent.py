@@ -3,8 +3,8 @@ import json
 from typing import Any
 
 from aidial_client import AsyncDial
-from aidial_client.types.chat.legacy.chat_completion import CustomContent, ToolCall
-from aidial_sdk.chat_completion import Message, Role, Choice, Request, Response
+from aidial_client.types.chat.legacy.chat_completion import CustomContent
+from aidial_sdk.chat_completion import Message, Role, Choice, Request, Response, ToolCall
 
 from task.tools.base import BaseTool
 from task.tools.models import ToolCallParams
@@ -27,7 +27,11 @@ class GeneralPurposeAgent:
         #    on the tool call step
         # 3. Create dict with `state` name. Inside this dict we need to add `TOOL_CALL_HISTORY_KEY` with empty array.
         #    Here, in state, we will 'hide' tool call history. We need it since we need to preserve full conversation history.
-        raise NotImplementedError()
+        self._endpoint = endpoint
+        self._system_prompt = system_prompt
+        self._tools = tools
+        self._tools_dict = {tool.name: tool for tool in tools}
+        self._state = { TOOL_CALL_HISTORY_KEY: [] }
 
     async def handle_request(self, deployment_name: str, choice: Choice, request: Request, response: Response) -> Message:
         #TODO:
@@ -70,7 +74,68 @@ class GeneralPurposeAgent:
         #       - extend the `state` `TOOL_CALL_HISTORY_KEY` with tool_messages that we executed above
         #       - finally make recursive call
         # 7. We don't have any tool calls and reasy to finish user request. Set choice with `state` and return `assistant_message`
-        raise NotImplementedError()
+        api_key = request.api_key
+        api_version = request.api_version
+        base_url = self._endpoint
+
+        dial_client = AsyncDial(base_url=base_url, api_key=api_key, api_version=api_version)
+        request_messages = self._prepare_messages(request.messages)
+        tools = [tool.schema for tool in self._tools]
+
+        chunks = await dial_client.chat.completions.create(
+            deployment_name=deployment_name,
+            messages=request_messages, # type: ignore
+            stream=True,
+            tools=tools,
+        )
+
+        tool_call_index_map = {}
+        content = ""
+
+        async for chunk in chunks:
+            if not chunk.choices or len(chunk.choices) == 0:
+                continue
+
+            delta = chunk.choices[0].delta
+            if not delta:
+                continue
+
+            if delta.content:
+                choice.append_content(delta.content)
+                content += delta.content
+
+            if delta.tool_calls:
+                for tool_call_delta in delta.tool_calls:
+                    if tool_call_delta.id:
+                        tool_call_index_map[tool_call_delta.index] = tool_call_delta
+                    else:
+                        tool_call = tool_call_index_map.get(tool_call_delta.index)
+                        if tool_call and tool_call_delta.function:
+                            arguments_chunk = tool_call_delta.function.arguments or ""
+                            tool_call.function.arguments += arguments_chunk
+        
+        tool_calls = [ToolCall.validate(tool_call) for tool_call in tool_call_index_map.values()]
+        assistant_message = Message(
+            role=Role.ASSISTANT,
+            content=content,
+            tool_calls=tool_calls
+        )
+
+        if assistant_message.tool_calls:
+            tasks = []
+            conversation_id = request.headers.get("x-conversation-id", "")
+
+            for tool_call in assistant_message.tool_calls:
+                tasks.append(self._process_tool_call(tool_call, choice, api_key, conversation_id))
+
+            tool_messages = await asyncio.gather(*tasks)
+            self._state[TOOL_CALL_HISTORY_KEY].append(assistant_message.model_dump(exclude_none=True))
+            self._state[TOOL_CALL_HISTORY_KEY].extend(tool_messages)
+
+            return await self.handle_request(deployment_name, choice, request, response)
+        
+        choice.set_state(self._state)
+        return assistant_message
 
     def _prepare_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
         #TODO:
@@ -80,7 +145,14 @@ class GeneralPurposeAgent:
         #    easier to manipulate LLM, so, best practices are to hide system prompt)
         # 3. Print history: iterate through unpacked messages and print as json (json.dumps)
         # 4. Return unpacked messages
-        raise NotImplementedError()
+        upacked_messages = unpack_messages(messages, self._state[TOOL_CALL_HISTORY_KEY])
+        upacked_messages.insert(0, Message(role=Role.SYSTEM, content=self._system_prompt).model_dump(exclude_none=True))
+        
+        print("History messages for LLM:")
+        for message in upacked_messages:
+            print(json.dumps(message, indent=2))
+        
+        return upacked_messages
 
     async def _process_tool_call(self, tool_call: ToolCall, choice: Choice, api_key: str, conversation_id: str) -> dict[str, Any]:
         #TODO:
@@ -96,4 +168,31 @@ class GeneralPurposeAgent:
         # 5. Execute tool
         # 6. Close stage with StageProcessor
         # 7. Return tool message as dict and don't forget to exclude none
-        raise NotImplementedError()
+        tool_name = tool_call.function.name
+
+        stage = StageProcessor.open_stage(choice, f"Tool call: {tool_name}")
+        tool = self._tools_dict.get(tool_name)
+
+        if not tool:
+            stage.append_content(f"Tool {tool_name} not found")
+            StageProcessor.close_stage_safely(stage)
+            return {}
+        
+        tool_arguments = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+        
+        if tool.show_in_stage:
+            stage.append_content("## Request arguments: \n")
+            stage.append_content(f"```json\n\r{json.dumps(tool_arguments, indent=2)}\n\r```\n\r")
+            stage.append_content("## Response: \n")
+
+        tool_response = await tool.execute(ToolCallParams(
+            tool_call=tool_call, # type: ignore
+            api_key=api_key,
+            stage=stage,
+            conversation_id=conversation_id,
+            choice=choice
+        ))
+
+        StageProcessor.close_stage_safely(stage)
+        
+        return tool_response.model_dump(exclude_none=True)
